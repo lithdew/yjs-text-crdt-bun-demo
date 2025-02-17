@@ -56,10 +56,18 @@ const readFrame = async (
 };
 
 class Note {
+  store = new Store({ isLoading: true, text: "" });
+
   doc = new Y.Doc();
   text = this.doc.getText("text");
-  store = new Store({ isLoading: true, text: "" });
   prev = "";
+
+  emitter: {
+    emitting: boolean;
+    buffer: Uint8Array[];
+    buffered: number;
+    timeout: ReturnType<typeof setTimeout> | null;
+  } = { emitting: false, buffer: [], buffered: 0, timeout: null };
 
   constructor() {
     this.doc.on("updateV2", (update, origin) => {
@@ -69,12 +77,91 @@ class Note {
       this.store.setState((state) => ({ ...state, text }));
 
       if (origin === "local") {
-        void fetch("/note", {
-          method: "POST",
-          body: update,
-        });
+        this.emitter.buffer.push(update);
+        this.emitter.buffered += update.byteLength;
+
+        if (this.emitter.buffered >= MAX_FRAME_LENGTH) {
+          void this.flushEmitter();
+        } else if (this.emitter.timeout === null) {
+          this.emitter.timeout = setTimeout(
+            () => void this.flushEmitter(),
+            300
+          );
+        }
       }
     });
+  }
+
+  async flushEmitter() {
+    if (this.emitter.timeout !== null) {
+      clearTimeout(this.emitter.timeout);
+      this.emitter.timeout = null;
+    }
+
+    if (this.emitter.emitting) {
+      return;
+    }
+
+    this.emitter.emitting = true;
+
+    while (this.emitter.buffered > 0) {
+      let update = undefined;
+      let numUnbuffered = 0;
+      for (const other of this.emitter.buffer) {
+        if (update === undefined) {
+          this.emitter.buffered -= other.byteLength;
+          update = other;
+          numUnbuffered++;
+          continue;
+        }
+
+        const merged = Y.mergeUpdatesV2([update, other]);
+        if (merged.byteLength > MAX_FRAME_LENGTH) {
+          break;
+        }
+
+        this.emitter.buffered -= other.byteLength;
+        update = merged;
+        numUnbuffered++;
+      }
+
+      if (numUnbuffered > 0) {
+        this.emitter.buffer.splice(0, numUnbuffered);
+      }
+
+      if (update === undefined) {
+        break;
+      }
+
+      console.log(`Sending ${update.byteLength} bytes`);
+
+      while (true) {
+        try {
+          const response = await fetch("/note", {
+            method: "POST",
+            body: update,
+            signal: AbortSignal.timeout(10_000),
+          });
+
+          const json = await response.json();
+          if (json.ok !== true) {
+            throw new Error(
+              `Failed to send update (HTTP ${response.status} ${
+                response.statusText
+              }): ${JSON.stringify(json)}`
+            );
+          }
+
+          break;
+        } catch (err) {
+          console.warn("Note stream error", err);
+        }
+      }
+
+      break;
+    }
+
+    this.emitter.emitting = false;
   }
 
   async stream(signal: AbortSignal) {
@@ -196,6 +283,7 @@ function Textarea() {
       disabled={isLoading}
       onChange={(e) => note.handleTextChange(e.target.value)}
       rows={5}
+      maxLength={2000}
     />
   );
 }
