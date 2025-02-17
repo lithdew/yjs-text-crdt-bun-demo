@@ -107,11 +107,12 @@ class Note {
     while (this.emitter.buffered > 0) {
       let update = undefined;
       let numUnbuffered = 0;
+      let numUnbufferedBytes = 0;
       for (const other of this.emitter.buffer) {
         if (update === undefined) {
-          this.emitter.buffered -= other.byteLength;
           update = other;
           numUnbuffered++;
+          numUnbufferedBytes += other.byteLength;
           continue;
         }
 
@@ -120,17 +121,18 @@ class Note {
           break;
         }
 
-        this.emitter.buffered -= other.byteLength;
         update = merged;
         numUnbuffered++;
-      }
-
-      if (numUnbuffered > 0) {
-        this.emitter.buffer.splice(0, numUnbuffered);
+        numUnbufferedBytes += other.byteLength;
       }
 
       if (update === undefined) {
         break;
+      }
+
+      if (numUnbuffered > 0 && numUnbufferedBytes > 0) {
+        this.emitter.buffer.splice(0, numUnbuffered);
+        this.emitter.buffered -= numUnbufferedBytes;
       }
 
       console.log(`Sending ${update.byteLength} bytes`);
