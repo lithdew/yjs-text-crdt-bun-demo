@@ -1,94 +1,72 @@
 import * as Y from "yjs";
 
+import { Store, useStore } from "@tanstack/react-store";
+import { useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { useCallback, useEffect, useRef, useState } from "react";
 
-function Textarea() {
-  const [doc] = useState(new Y.Doc());
-  const [text] = useState(doc.getText("text"));
+const MAX_FRAME_LENGTH = 1 * 1024 * 1024;
 
-  const [value, setValue] = useState(text.toJSON());
-  const prev = useRef(value);
-
-  useEffect(() => {
-    const controller = new AbortController();
-
-    async function feed(signal: AbortSignal) {
-      const response = await fetch("/stream", {
-        method: "POST",
-        signal,
-        body: Y.encodeStateVector(doc),
-      });
-
-      if (response.body === null) {
-        throw new Error("No body");
-      }
-
-      const reader = response.body.getReader();
-
-      let bytes = Uint8Array.of();
-
-      const readFrame = async () => {
-        while (bytes.byteLength < 8) {
-          const { done, value } = await reader.read();
-          if (done) {
-            break;
-          }
-
-          bytes = new Uint8Array(bytes.byteLength + value.byteLength);
-          bytes.set(value, bytes.byteLength - value.byteLength);
-        }
-
-        if (bytes.byteLength < 8) {
-          return null;
-        }
-
-        const frameLength = Number(
-          new DataView(bytes.buffer.slice(0, 8)).getBigUint64(0, true)
-        );
-        bytes = new Uint8Array(bytes.buffer.slice(8));
-
-        while (bytes.byteLength < frameLength) {
-          const { done, value } = await reader.read();
-          if (done) {
-            break;
-          }
-
-          bytes = new Uint8Array(bytes.byteLength + value.byteLength);
-          bytes.set(value, bytes.byteLength - value.byteLength);
-        }
-
-        if (bytes.byteLength < frameLength) {
-          return null;
-        }
-
-        const update = bytes.slice(0, frameLength);
-        bytes = bytes.slice(frameLength);
-
-        return update;
-      };
-
-      while (true) {
-        const update = await readFrame();
-        if (update === null) {
-          break;
-        }
-
-        Y.applyUpdateV2(doc, update, "remote");
-      }
+const readFrame = async (
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  bytes: Uint8Array<ArrayBuffer>
+) => {
+  while (bytes.byteLength < 8) {
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
     }
 
-    void feed(controller.signal);
+    bytes = new Uint8Array(bytes.byteLength + value.byteLength);
+    bytes.set(value, bytes.byteLength - value.byteLength);
+  }
 
-    return () => {
-      controller.abort();
-    };
-  }, []);
+  if (bytes.byteLength < 8) {
+    throw new Error("Connection prematurely closed while reading frame length");
+  }
 
-  useEffect(() => {
-    const handler = (update: Uint8Array, origin: any) => {
-      prev.current = text.toJSON();
-      setValue(text.toJSON());
+  const frameLengthU64 = new DataView(bytes.buffer.slice(0, 8)).getBigUint64(
+    0,
+    true
+  );
+  if (frameLengthU64 > BigInt(MAX_FRAME_LENGTH)) {
+    throw new Error("Frame length too large");
+  }
+
+  const frameLength = Number(frameLengthU64);
+  bytes = new Uint8Array(bytes.buffer.slice(8));
+
+  while (bytes.byteLength < frameLength) {
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
+    }
+
+    bytes = new Uint8Array(bytes.byteLength + value.byteLength);
+    bytes.set(value, bytes.byteLength - value.byteLength);
+  }
+
+  if (bytes.byteLength < frameLength) {
+    throw new Error("Connection prematurely closed while reading frame");
+  }
+
+  const frame = bytes.slice(0, frameLength);
+  bytes = bytes.slice(frameLength);
+
+  return { frame, rest: bytes };
+};
+
+class Note {
+  doc = new Y.Doc();
+  text = this.doc.getText("text");
+  store = new Store({ isLoading: true, text: "" });
+  prev = "";
+
+  constructor() {
+    this.doc.on("updateV2", (update, origin) => {
+      const text = this.text.toJSON();
+
+      this.prev = text;
+      this.store.setState((state) => ({ ...state, text }));
 
       if (origin === "local") {
         void fetch("/note", {
@@ -96,36 +74,87 @@ function Textarea() {
           body: update,
         });
       }
-    };
+    });
+  }
 
-    doc.on("updateV2", handler);
+  async stream(signal: AbortSignal) {
+    while (true) {
+      this.store.setState((state) => ({ ...state, isLoading: true }));
 
-    return () => {
-      doc.off("updateV2", handler);
-    };
-  }, []);
+      try {
+        const response = await fetch("/stream", {
+          method: "POST",
+          signal,
+          body: Y.encodeStateVector(this.doc),
+        });
 
-  const onChange = useCallback((e: React.ChangeEvent<HTMLTextAreaElement>) => {
-    const updated = e.target.value;
-    const old = prev.current;
+        if (response.body === null) {
+          throw new Error("No body");
+        }
 
+        const reader = response.body.getReader();
+
+        let bytes = Uint8Array.of();
+        let numUpdatesHandled = 0;
+
+        while (true) {
+          const { frame, rest } = await readFrame(reader, bytes);
+          Y.applyUpdateV2(this.doc, frame, "remote");
+          bytes = rest;
+
+          numUpdatesHandled++;
+          if (numUpdatesHandled === 1) {
+            this.store.setState((state) => ({ ...state, isLoading: false }));
+          }
+        }
+      } catch (err) {
+        this.store.setState((state) => ({ ...state, isLoading: true }));
+
+        if (
+          signal.aborted ||
+          (err instanceof Error && err.name === "AbortError")
+        ) {
+          break;
+        }
+
+        await new Promise<void>((resolve) => {
+          const handle = setTimeout(() => {
+            resolve();
+          }, 1000);
+
+          signal.addEventListener(
+            "abort",
+            () => {
+              clearTimeout(handle);
+              resolve();
+            },
+            { once: true }
+          );
+        });
+
+        console.warn("Note stream error", err);
+      }
+    }
+  }
+
+  handleTextChange(updated: string) {
     let start = 0;
-    let oldEnd = old.length;
+    let oldEnd = this.prev.length;
     let newEnd = updated.length;
 
-    // Find first differing character
+    // Find first differing character.
     while (
-      start < Math.min(old.length, updated.length) &&
-      old[start] === updated[start]
+      start < Math.min(this.prev.length, updated.length) &&
+      this.prev[start] === updated[start]
     ) {
       start++;
     }
 
-    // Find last differing character
+    // Find last differing character.
     while (
       oldEnd > start &&
       newEnd > start &&
-      old[oldEnd - 1] === updated[newEnd - 1]
+      this.prev[oldEnd - 1] === updated[newEnd - 1]
     ) {
       oldEnd--;
       newEnd--;
@@ -134,24 +163,38 @@ function Textarea() {
     const numDeleted = oldEnd - start;
     const inserted = updated.slice(start, newEnd);
 
-    doc.transact(() => {
+    this.doc.transact(() => {
       if (numDeleted > 0) {
-        text.delete(start, numDeleted);
+        this.text.delete(start, numDeleted);
       }
       if (inserted.length > 0) {
-        text.insert(start, inserted);
+        this.text.insert(start, inserted);
       }
     }, "local");
 
-    prev.current = updated;
+    this.prev = updated;
+  }
+}
+
+function Textarea() {
+  const [note] = useState(() => new Note());
+
+  const text = useStore(note.store, (state) => state.text);
+  const isLoading = useStore(note.store, (state) => state.isLoading);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    void note.stream(controller.signal);
+    return () => controller.abort();
   }, []);
 
   return (
     <textarea
       placeholder="Enter some text..."
-      className="border p-4 resize-none w-full"
-      value={value}
-      onChange={onChange}
+      className="border p-4 resize-none w-full disabled:opacity-50"
+      value={text}
+      disabled={isLoading}
+      onChange={(e) => note.handleTextChange(e.target.value)}
       rows={5}
     />
   );
